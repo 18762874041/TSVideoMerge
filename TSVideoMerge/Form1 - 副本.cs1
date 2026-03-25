@@ -1,0 +1,224 @@
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+
+namespace TSVideoMerge
+{
+    public partial class Form1 : Form
+    {
+        public Form1()
+        {
+            InitializeComponent();
+        }
+
+
+        private void textBox1_Click(object sender, EventArgs e)
+        {
+            using (folderBrowserDialog1)
+            {
+                var dialog = folderBrowserDialog1.ShowDialog(this);
+
+                if (dialog == DialogResult.OK)
+                {
+                    textBox1.Text = folderBrowserDialog1.SelectedPath;
+                }
+            }
+        }
+
+        private void button1_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(textBox1.Text))
+            {
+                MessageBox.Show("请选择TS文件目录");
+            } else {
+                dataGridView1.Rows.Clear();
+                var directories = findDirectoriesWithTsFiles(textBox1.Text);
+                foreach (var item in directories)
+                {
+                    var fileCount = Directory.GetFiles(item, "*.ts").Length;
+                    var arr = item.Split(Path.DirectorySeparatorChar);
+                    if (arr.Last<string>().ToLower().Equals("video"))
+                    {
+                        dataGridView1.Rows.Add(item, arr[arr.Length - 2], fileCount, "");
+                    } else{
+                        dataGridView1.Rows.Add(item, arr[arr.Length - 1], fileCount, "");
+                    }
+                }
+            }
+        }
+
+        private void button2_Click(object sender, EventArgs e)
+        {
+            var rows = dataGridView1.Rows;           
+            foreach (DataGridViewRow row in rows)
+            {
+                Task.Run(() => {
+                    var filePath = row.Cells[0].Value.ToString();
+                    
+                    var mp4FileName = row.Cells[1].Value.ToString().Replace(".m3u8", "").Replace(" ", "")+ ".mp4";
+
+                    File.Delete(filePath+ Path.DirectorySeparatorChar + mp4FileName);
+                    var dir = new DirectoryInfo(filePath);
+
+                    var temName = dir.FullName + "\\ts_list.txt";
+                    File.Delete(temName);
+
+                    var dirSize = getDirectorySize(filePath)/1024; 
+
+                    File.WriteAllLines(temName, dir.GetFiles("*.ts").Select(o => $"file '{o.FullName}'").OrderBy(s =>
+                    {
+                        var sIdx = s.LastIndexOf(@"\") + 1;
+                        return int.Parse(s.Substring(sIdx, s.LastIndexOf(".") - sIdx));
+                    }));
+
+                    ProcessStartInfo startInfo = new ProcessStartInfo();
+                    startInfo.FileName = "cmd.exe";
+                    startInfo.CreateNoWindow = true; 
+                    startInfo.UseShellExecute = false;
+                    startInfo.RedirectStandardInput = true;
+                    startInfo.RedirectStandardOutput = true;                    
+                    startInfo.RedirectStandardError = true;                    
+
+                    using (var p = Process.Start(startInfo))
+                    {
+                        p.StandardInput.WriteLine("cd " + filePath);
+                        p.StandardInput.Flush();                                           
+                      
+                        p.StandardInput.WriteLine($"ffmpeg -f concat -safe 0 -i ts_list.txt -c copy {mp4FileName}");
+                        p.StandardInput.Flush();
+                        var isExit = false;
+                        Task.Run(() =>
+                        {
+                            while (!isExit)
+                            {
+                                string text = p.StandardError.ReadLine(); //"size= 201472kib time";                                 
+                                if (!string.IsNullOrWhiteSpace(text))
+                                {
+                                    if (text.StartsWith("[out#0"))
+                                    {
+                                        BeginInvoke(() =>
+                                        {
+                                            row.Cells[3].Value = 100;
+                                        });
+                                        p.StandardInput.WriteLine($"exit");
+                                        p.StandardInput.Flush();
+                                        isExit = true;
+                                    }
+                                    else
+                                    {
+                                        double? number = ExtractSizeNumber(text);
+                                        if (number.HasValue)
+                                        {
+                                            Debug.WriteLine($"提取到的数字: {number.Value}");
+                                            var p = Convert.ToInt32((number.Value / dirSize) * 100);
+                                            BeginInvoke(() =>
+                                            {
+                                                row.Cells[3].Value = p;
+                                            });
+                                        }
+                                    }
+                                }
+                                Thread.Sleep(100);
+                            }                         
+                        });
+                        p.WaitForExit();
+                        isExit = true;                        
+                    }
+                    File.Delete(temName);
+                });
+            }
+        }
+
+
+        private const int MAX_DEPTH = 6;
+
+
+        /// <summary>
+        /// 递归查找目录下所有包含.ts文件的目录
+        /// </summary>
+        /// <param name="directoryPath">要搜索的目录路径</param>
+        /// <param name="currentDepth">当前递归深度</param>
+        /// <returns>包含.ts文件的目录路径集合</returns>
+        public HashSet<string> findDirectoriesWithTsFiles(string directoryPath,int currentDepth = 0)
+        {
+            var directoriesWithTsFiles = new HashSet<string>();
+
+            if (!Directory.Exists(directoryPath))
+            {
+                MessageBox.Show($"目录不存在: {directoryPath}");
+                return directoriesWithTsFiles;
+            }
+
+            // 检查递归深度限制
+            if (currentDepth > MAX_DEPTH)
+            {
+                return directoriesWithTsFiles;
+            }
+
+            try
+            {
+                // 获取当前目录下的所有子目录
+                string[] subDirectories = Directory.GetDirectories(directoryPath);
+
+                // 检查当前目录是否包含.ts文件
+                string[] tsFiles = Directory.GetFiles(directoryPath, "*.ts");
+                if (tsFiles.Length > 0)
+                {
+                    directoriesWithTsFiles.Add(directoryPath);
+                }
+
+                // 递归处理所有子目录
+                foreach (string subDirectory in subDirectories)
+                {
+                    var subDirTsDirectories = findDirectoriesWithTsFiles(subDirectory);
+                    foreach (string dir in subDirTsDirectories)
+                    {
+                        directoriesWithTsFiles.Add(dir);
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                MessageBox.Show($"无权限访问目录: {directoryPath}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"处理目录时发生错误！");
+            }
+
+            return directoriesWithTsFiles;
+        }
+
+
+        long getDirectorySize(string directoryPath)
+        {
+            DirectoryInfo directoryInfo = new DirectoryInfo(directoryPath);
+            long size = 0;
+
+            foreach (FileInfo file in directoryInfo.GetFiles())
+            {
+                size += file.Length;
+            }
+
+            //foreach (DirectoryInfo subDirectory in directoryInfo.GetDirectories())
+            //{
+            //    size += GetDirectorySize(subDirectory.FullName);
+            //}
+
+            return size;
+        }
+
+
+        static double? ExtractSizeNumber(string text)
+        {
+            // 使用正则表达式匹配 size= 后面的数字（包括小数点）
+            Match match = Regex.Match(text, @"size=\s*(\d+(?:\.\d+)?)");
+            if (match.Success)
+            {
+                return double.Parse(match.Groups[1].Value);
+            }
+            return null;
+        }
+    }
+}
